@@ -1,7 +1,12 @@
-use std::collections::LinkedList;
+//Implemented all the functions that were undone here in AddressSpace, didn't get to implementing tests, and i'm not sure exactly what I was supposed to do with the flags, but I believe all the helper functions are functional
+//Would love to understand what exactly I was supposed to do with the flags, and where they were supposed to be integrated into the function implementation
+
 use std::sync::Arc;
 
 use crate::data_source::DataSource;
+
+pub const PAGE_SIZE: usize = 4096;
+pub const VADDR_MAX: usize = (1 << 38) - 1;
 
 type VirtualAddress = usize;
 
@@ -10,12 +15,26 @@ struct MapEntry {
     offset: usize,
     span: usize,
     addr: usize,
+    flags: FlagBuilder
+}
+
+impl MapEntry {
+    #[must_use] // <- not using return value of "new" doesn't make sense, so warn
+    pub fn new(source: Arc<dyn DataSource>, offset: usize, span: usize, addr: usize, flags: FlagBuilder) -> MapEntry {
+        MapEntry {
+            source: source.clone(),
+            offset,
+            span,
+            addr,
+            flags,
+        }
+    }
 }
 
 /// An address space.
 pub struct AddressSpace {
     name: String,
-    mappings: LinkedList<MapEntry>, // see below for comments
+    mappings: Vec<MapEntry>, // see below for comments
 }
 
 // comments about storing mappings
@@ -34,35 +53,68 @@ impl AddressSpace {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            mappings: LinkedList::new(),
-        }
+            mappings: Vec::new(), // <- here I changed from LinkedList, for reasons
+        } // I encourage you to try other sparse representations - trees, DIY linked lists, ...
     }
 
     /// Add a mapping from a `DataSource` into this `AddressSpace`.
     ///
     /// # Errors
     /// If the desired mapping is invalid.
-    pub fn add_mapping<D: DataSource>(
-        &self,
-        source: &D,
+    /// TODO: how does our test in lib.rs succeed?
+    // pub fn add_mapping<'a, D: DataSource + 'a>(
+    //     &'a mut self,
+    pub fn add_mapping<D: DataSource + 'static>(
+        &mut self,
+        source: Arc<D>,
         offset: usize,
         span: usize,
+        flags: FlagBuilder,
     ) -> Result<VirtualAddress, &str> {
-        todo!()
+        let mut addr_iter = PAGE_SIZE; // let's not map page 0
+        let mut gap;
+        for mapping in &self.mappings {
+            gap = mapping.addr - addr_iter;
+            if gap > span + 2 * PAGE_SIZE {
+                break;
+            }
+            addr_iter = mapping.addr + mapping.span;
+        }
+        if addr_iter + span + 2 * PAGE_SIZE < VADDR_MAX {
+            let mapping_addr = addr_iter + PAGE_SIZE;
+            let new_mapping = MapEntry::new(source, offset, span, mapping_addr, flags);
+            self.mappings.push(new_mapping);
+            self.mappings.sort_by(|a, b| a.addr.cmp(&b.addr));
+            return Ok(mapping_addr);
+        }
+        Err("out of address space!")
     }
 
     /// Add a mapping from `DataSource` into this `AddressSpace` starting at a specific address.
     ///
     /// # Errors
     /// If there is insufficient room subsequent to `start`.
-    pub fn add_mapping_at<D: DataSource>(
-        &self,
-        source: &D,
+    pub fn add_mapping_at<D: DataSource + 'static>(
+        &mut self,
+        source: Arc<D>,
         offset: usize,
         span: usize,
         start: VirtualAddress,
-    ) -> Result<(), &str> {
-        todo!()
+        flags: FlagBuilder
+    ) -> Result<VirtualAddress, &str> {
+        let mut check = true;
+        for mapping in &self.mappings{
+            if ((mapping.addr < start) && (mapping.addr + mapping.span) > start) || ((mapping.addr > start) && (mapping.addr < start + span)){ //Ensure room to put in
+                check = false;
+            }
+        }
+        if check{
+            let new_mapping = MapEntry::new(source,offset,span,start,flags); 
+            self.mappings.push(new_mapping);
+            return Ok(start);
+        }
+        Err("No room at start!")
+        
     }
 
     /// Remove the mapping to `DataSource` that starts at the given address.
@@ -70,26 +122,52 @@ impl AddressSpace {
     /// # Errors
     /// If the mapping could not be removed.
     pub fn remove_mapping<D: DataSource>(
-        &self,
-        source: &D,
+        &mut self,
+        source: Arc<dyn DataSource>, //Changed this to dyn DataSource from D to make it work, don't think it messed anything up?
         start: VirtualAddress,
-    ) -> Result<(), &str> {
-        todo!()
-    }
+    ) -> Result<(),&str> {
+        let mut ctr = 0;
+        for mapping in &self.mappings {
+            if Arc::ptr_eq(&mapping.source, &source) {
+                self.mappings.remove(ctr);
+                break;
+            }
+            ctr += 1;
+            
+            }
+        Err("out of address space!")
+        }
+       
 
     /// Look up the DataSource and offset within that DataSource for a
     /// VirtualAddress / AccessType in this AddressSpace
-    /// 
+    ///
     /// # Errors
     /// If this VirtualAddress does not have a valid mapping in &self,
     /// or if this AccessType is not permitted by the mapping
     pub fn get_source_for_addr<D: DataSource>(
         &self,
         addr: VirtualAddress,
-        access_type: FlagBuilder
-    ) -> Result<(&D, usize), &str> {
-        todo!();
+        access_type: FlagBuilder,
+    ) -> Result<(Arc<dyn DataSource>, usize), &str> { //Also changed this to dyn DataSource
+        for mapping in &self.mappings{
+            if mapping.addr == addr{
+                let d_source = mapping.source.clone(); //Cloned in order to return, wouldn't let me move data, but we are just trying to figure out what is there so it works
+                return Ok((d_source,mapping.span));
+            }
+        }
+        Err("No mapping at address")
     }
+
+    /// Helper function for looking up mappings
+    fn get_mapping_for_addr(&self, addr: VirtualAddress) -> Result<&MapEntry, &str> { //Decided to pass ptr to mapEntry instead of trying to pass it itself, helped with cloning issues
+        for mapping in &self.mappings{
+            if mapping.addr == addr{
+                return Ok(mapping);
+            }
+    }
+    Err("No mapping at address")
+}
 }
 
 /// Build flags for address space maps.
@@ -116,6 +194,24 @@ pub struct FlagBuilder {
     shared: bool,
 }
 
+impl FlagBuilder {
+    pub fn check_access_perms(&self, access_perms: FlagBuilder) -> bool {
+        if access_perms.read && !self.read || access_perms.write && !self.write || access_perms.execute && !self.execute {
+            return false;
+        }    
+        true    
+    }
+
+    pub fn is_valid(&self) -> bool {
+        if self.private && self.shared {
+            return false;
+        }
+        if self.cow && self.write { // for COW to work, write needs to be off until after the copy
+            return false;
+        }
+        return true;
+    }
+}
 /// Create a constructor and toggler for a `FlagBuilder` object. Will capture attributes, including documentation
 /// comments and apply them to the generated constructor.
 macro_rules! flag {
@@ -218,4 +314,3 @@ impl FlagBuilder {
         }
     }
 }
-
